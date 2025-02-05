@@ -29,12 +29,15 @@ SOFTWARE.
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
+use std::io::Read;
+use std::fs::File;
 
 use crate::stack_trace;
 use remoteprocess::{Pid, Tid};
 
 use anyhow::Error;
 use serde_derive::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use crate::config::Config;
 
@@ -190,21 +193,27 @@ impl Frame {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SampleRecord {
+    pid: Pid,
+    tid: Tid,
+    frame_indices: Vec<usize>,
+    thread_name: String,
+}
+
 pub struct Stats {
-    samples: HashMap<(Pid, Tid), Vec<Vec<usize>>>,
+    temp_file: NamedTempFile,
     frames: Vec<Frame>,
     frame_to_index: HashMap<stack_trace::Frame, usize>,
-    thread_name_map: HashMap<(Pid, Tid), String>,
     config: Config,
 }
 
 impl Stats {
     pub fn new(config: &Config) -> Stats {
         Stats {
-            samples: HashMap::new(),
+            temp_file: NamedTempFile::new().expect("Failed to create temporary file"),
             frames: vec![],
             frame_to_index: HashMap::new(),
-            thread_name_map: HashMap::new(),
             config: config.clone(),
         }
     }
@@ -229,35 +238,61 @@ impl Stats {
             .collect();
         frame_indices.reverse();
 
-        let key = (stack.pid as Pid, stack.thread_id as Tid);
+        let thread_name = stack
+            .thread_name
+            .as_ref()
+            .map_or_else(|| "".to_string(), |x| x.clone());
+        
+        let thread_name = if self.config.subprocesses {
+            format!(
+                "Process {} Thread {} \"{}\"",
+                stack.pid,
+                stack.format_threadid(),
+                thread_name
+            )
+        } else {
+            format!("Thread {} \"{}\"", stack.format_threadid(), thread_name)
+        };
 
-        self.samples.entry(key).or_default().push(frame_indices);
-        let subprocesses = self.config.subprocesses;
-        self.thread_name_map.entry(key).or_insert_with(|| {
-            let thread_name = stack
-                .thread_name
-                .as_ref()
-                .map_or_else(|| "".to_string(), |x| x.clone());
-            if subprocesses {
-                format!(
-                    "Process {} Thread {} \"{}\"",
-                    stack.pid,
-                    stack.format_threadid(),
-                    thread_name
-                )
-            } else {
-                format!("Thread {} \"{}\"", stack.format_threadid(), thread_name)
-            }
-        });
+        let record = SampleRecord {
+            pid: stack.pid as Pid,
+            tid: stack.thread_id as Tid,
+            frame_indices,
+            thread_name,
+        };
 
+        // Serialize and write the record to the temp file
+        serde_json::to_writer(&mut self.temp_file, &record)?;
+        writeln!(&mut self.temp_file)?;
+        
         Ok(())
     }
 
     pub fn write(&self, w: &mut dyn Write) -> Result<(), Error> {
+        // Create maps to store the aggregated data
+        let mut samples: HashMap<(Pid, Tid), Vec<Vec<usize>>> = HashMap::new();
+        let mut thread_name_map: HashMap<(Pid, Tid), String> = HashMap::new();
+
+        // Rewind the temp file for reading
+        let mut temp_file = File::open(self.temp_file.path())?;
+        let mut contents = String::new();
+        temp_file.read_to_string(&mut contents)?;
+
+        // Process each line
+        for line in contents.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let record: SampleRecord = serde_json::from_str(line)?;
+            let key = (record.pid, record.tid);
+            samples.entry(key).or_default().push(record.frame_indices);
+            thread_name_map.insert(key, record.thread_name);
+        }
+
         let json = serde_json::to_string(&SpeedscopeFile::new(
-            &self.samples,
+            &samples,
             &self.frames,
-            &self.thread_name_map,
+            &thread_name_map,
             self.config.sampling_rate,
         ))?;
         writeln!(w, "{}", json)?;
